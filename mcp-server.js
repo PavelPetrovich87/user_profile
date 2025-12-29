@@ -6,6 +6,8 @@ const {
 } = require("@modelcontextprotocol/sdk/types.js");
 const axios = require("axios");
 const { z } = require("zod");
+const { spawn } = require("child_process");
+const path = require("path");
 
 const API_BASE_URL = "http://localhost:3000";
 
@@ -138,13 +140,74 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
   }
 });
 
+let expressProcess;
+
+async function startExpressServer() {
+    return new Promise((resolve, reject) => {
+        console.error("Starting Express server...");
+        const serverPath = path.join(__dirname, "server.js");
+        expressProcess = spawn("node", [serverPath], {
+            stdio: ["ignore", "pipe", "inherit"],
+        });
+
+        // Redirect Express stdout to stderr to prevent MCP protocol corruption
+        expressProcess.stdout.pipe(process.stderr);
+
+        expressProcess.on("error", (err) => {
+            console.error("Failed to start Express server:", err);
+            reject(err);
+        });
+
+        expressProcess.on("exit", (code) => {
+            if (code !== 0 && code !== null) {
+                const err = new Error(`Express server exited with code ${code}`);
+                console.error(err.message);
+                reject(err);
+            }
+        });
+
+        // Wait until the server is reachable
+        let attempts = 0;
+        const maxAttempts = 10;
+        const poll = async () => {
+            try {
+                await axios.get(`${API_BASE_URL}/user-context`);
+                console.error("Express server is ready.");
+                resolve();
+            } catch (error) {
+                attempts++;
+                if (attempts >= maxAttempts) {
+                    reject(new Error("Express server failed to become ready in time."));
+                } else {
+                    setTimeout(poll, 500);
+                }
+            }
+        };
+        poll();
+    });
+}
+
 async function main() {
+    await startExpressServer();
   const transport = new StdioServerTransport();
   await server.connect(transport);
   console.error("User Profile MCP Server running on stdio");
 }
 
+// Cleanup on exit
+const cleanup = () => {
+    if (expressProcess) {
+        console.error("Shutting down Express server...");
+        expressProcess.kill();
+    }
+};
+
+process.on("SIGINT", cleanup);
+process.on("SIGTERM", cleanup);
+process.on("exit", cleanup);
+
 main().catch((error) => {
   console.error("Fatal error in main():", error);
+    cleanup();
   process.exit(1);
 });
